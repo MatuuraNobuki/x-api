@@ -1,0 +1,46 @@
+name: fetch-x-metrics
+
+on:
+  schedule:
+    # 毎時0分に起動(UTC基準)。GitHub混雑時は数分〜十数分ずれることがある。
+    - cron: "0 * * * *"
+  workflow_dispatch: {} # 手動実行ボタンも有効化(テスト用)
+
+# CSVをコミットするために書き込み権限が必要
+permissions:
+  contents: write
+
+# 多重起動を防ぐ(前回が長引いても重ならない)
+concurrency:
+  group: fetch-x-metrics
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリを取得
+        uses: actions/checkout@v4
+
+      - name: Node.js をセットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: データ取得スクリプトを実行
+        env:
+          TWITTERAPI_KEY: ${{ secrets.TWITTERAPI_KEY }}
+          X_USERNAME: suiryuuuuu
+        run: node fetch.js
+
+      - name: 変更があればコミット
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "変更なし。コミットをスキップします。"
+          else
+            git commit -m "update metrics: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi

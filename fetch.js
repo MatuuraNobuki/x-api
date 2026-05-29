@@ -18,7 +18,7 @@ const path = require("path");
 
 const API_KEY = process.env.TWITTERAPI_KEY;
 const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
-const WEEKS_BACK = parseInt(process.env.WEEKS_BACK || "100", 10);
+const WEEKS_BACK = parseInt(process.env.WEEKS_BACK || "10", 10);
 const BASE = "https://api.twitterapi.io";
 
 // 1チャンク内のページング安全弁

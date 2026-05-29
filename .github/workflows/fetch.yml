@@ -31,7 +31,7 @@ jobs:
         env:
           TWITTERAPI_KEY: ${{ secrets.TWITTERAPI_KEY }}
           X_USERNAME: suiryuuuuu
-          WEEKS_BACK: "100"
+          WEEKS_BACK: "10"
         run: node fetch.js
 
       - name: 変更があればコミット

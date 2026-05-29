@@ -29,9 +29,9 @@ jobs:
 
       - name: データ取得スクリプトを実行
         env:
-          TWITTERAPI_KEY: ${{ secrets.TWITTERAPI_KEY }}
+          SORSA_API_KEY: ${{ secrets.SORSA_API_KEY }}
           X_USERNAME: suiryuuuuu
-          WEEKS_BACK: "10"
+          MAX_PAGES: "20"
         run: node fetch.js
 
       - name: 変更があればコミット

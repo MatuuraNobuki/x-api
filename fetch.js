@@ -1,28 +1,24 @@
 // fetch.js
-// TwitterAPI.io の Advanced Search を「日付チャンク分割」で叩き、
-// @suiryuuuuu のツイートを取りこぼしなく取得して3つのCSVに記録する。
+// Sorsa API の /user-tweets で @suiryuuuuu のタイムラインを取得し、
+// 3つのCSV(tweets / metrics / account)に追記・更新する。
 //
-// なぜ日付チャンクか:
-//   Advanced Search の Latest は、日付指定なしだと新しい方に偏り、
-//   古いツイートが has_next_page=false で静かに打ち切られる(検索の深さの壁)。
-//   since:/until: で1週間ごとの窓に区切ると、各窓は件数が少なく深さの壁に
-//   当たらないため、全期間を確実に辿れる。
+// なぜ Sorsa /user-tweets か:
+//   TwitterAPI.io は last_tweets(ページング不安定) も advanced_search(検索の
+//   歯抜け) も全件取れなかった。Sorsa の user-tweets はタイムライン直接取得で、
+//   検証では別ツールの全48件+αを1ページで取りこぼしゼロでカバーできた。
 //
 // 必要な環境変数:
-//   TWITTERAPI_KEY ... TwitterAPI.io のAPIキー (GitHub Secrets から渡す)
-//   X_USERNAME     ... 対象のハンドル(@抜き)。未設定なら下のDEFAULT。
-//   WEEKS_BACK     ... 何週間さかのぼるか(未設定なら6週)。
+//   SORSA_API_KEY ... Sorsa のAPIキー (GitHub Secrets から渡す)
+//   X_USERNAME    ... 対象のハンドル(@抜き)。未設定なら下のDEFAULT。
+//   MAX_PAGES     ... 取得ページ数の上限(未設定なら5。1ページ約20件)。
 
 const fs = require("fs");
 const path = require("path");
 
-const API_KEY = process.env.TWITTERAPI_KEY;
+const API_KEY = process.env.SORSA_API_KEY;
 const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
-const WEEKS_BACK = parseInt(process.env.WEEKS_BACK || "6", 10);
-const BASE = "https://api.twitterapi.io";
-
-// 1チャンク内のページング安全弁
-const MAX_PAGES_PER_CHUNK = 10;
+const MAX_PAGES = parseInt(process.env.MAX_PAGES || "20", 10);
+const BASE_URL = "https://api.sorsa.io/v3";
 
 const DATA_DIR = path.join(__dirname, "data");
 const TWEETS_CSV = path.join(DATA_DIR, "tweets.csv");
@@ -30,7 +26,7 @@ const METRICS_CSV = path.join(DATA_DIR, "metrics.csv");
 const ACCOUNT_CSV = path.join(DATA_DIR, "account.csv");
 
 if (!API_KEY) {
-  console.error("環境変数 TWITTERAPI_KEY が設定されていません。");
+  console.error("環境変数 SORSA_API_KEY が設定されていません。");
   process.exit(1);
 }
 
@@ -60,15 +56,19 @@ function loadExistingTweetIds() {
   return ids;
 }
 
-async function apiGet(endpoint, params) {
-  const url = new URL(BASE + endpoint);
-  Object.entries(params).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
-  });
+// Sorsa は POST + ヘッダー ApiKey。リトライ付き。
+async function fetchPage(cursor) {
+  const body = { username: USERNAME };
+  if (cursor) body.next_cursor = cursor;
+
   const maxRetry = 3;
   for (let attempt = 1; attempt <= maxRetry; attempt++) {
     try {
-      const res = await fetch(url, { headers: { "X-API-Key": API_KEY } });
+      const res = await fetch(`${BASE_URL}/user-tweets`, {
+        method: "POST",
+        headers: { ApiKey: API_KEY, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       return await res.json();
     } catch (err) {
@@ -79,57 +79,26 @@ async function apiGet(endpoint, params) {
   }
 }
 
-function extractTweets(json) {
-  if (Array.isArray(json?.tweets)) return json.tweets;
-  if (Array.isArray(json?.data?.tweets)) return json.data.tweets;
-  if (Array.isArray(json?.data)) return json.data;
-  return [];
+// フィールド名の揺れに両対応(Playground簡略形 と ドキュメントのcount形)
+function num(t, ...keys) {
+  for (const k of keys) {
+    if (t[k] !== undefined && t[k] !== null) return t[k];
+  }
+  return 0;
+}
+function str(t, ...keys) {
+  for (const k of keys) {
+    if (t[k] !== undefined && t[k] !== null) return t[k];
+  }
+  return "";
 }
 
 function isRetweet(t) {
+  if (t.isRetweet === true || t.is_retweet === true) return true;
   if (t.retweeted_tweet) return true;
-  if (typeof t.text === "string" && t.text.startsWith("RT @")) return true;
+  const text = str(t, "content", "full_text", "text");
+  if (typeof text === "string" && text.startsWith("RT @")) return true;
   return false;
-}
-
-// YYYY-MM-DD 形式(Advanced Search の since:/until: はこの形式のみ)
-function ymd(date) {
-  return date.toISOString().slice(0, 10);
-}
-
-// 1つの日付チャンクをページングして全ツイートを返す。
-// 重要: このAPIは since:/until:(YYYY-MM-DD) を無視する。
-//       Unix秒の since_time:/until_time: を使わないと日付で絞れない。
-async function fetchChunk(sinceEpoch, untilEpoch, label) {
-  // -filter:retweets でRT除外。返信や雑談はそのまま含まれる。
-  const query = `from:${USERNAME} since_time:${sinceEpoch} until_time:${untilEpoch} -filter:retweets`;
-  let tweets = [];
-  let cursor = "";
-  const usedCursors = new Set();
-
-  for (let page = 0; page < MAX_PAGES_PER_CHUNK; page++) {
-    let json;
-    try {
-      json = await apiGet("/twitter/tweet/advanced_search", {
-        query,
-        queryType: "Latest",
-        cursor,
-      });
-    } catch (err) {
-      console.error(`  [${label}] 取得失敗:`, err.message);
-      break;
-    }
-    const pageTweets = extractTweets(json);
-    tweets = tweets.concat(pageTweets);
-
-    const hasNext = json?.has_next_page;
-    const nextCursor = json?.next_cursor || "";
-    if (!hasNext || !nextCursor || usedCursors.has(nextCursor)) break;
-    usedCursors.add(nextCursor);
-    cursor = nextCursor;
-  }
-  console.log(`  チャンク ${label}: ${tweets.length}件`);
-  return tweets;
 }
 
 async function main() {
@@ -143,47 +112,61 @@ async function main() {
 
   const fetchedAt = new Date().toISOString();
 
-  // --- 今日から WEEKS_BACK 週ぶん、1週間ごとの窓で検索する ---
-  // since_time/until_time は Unix秒。窓を1日重ねて境界の取りこぼしを防ぐ。
+  // --- ページングしながらタイムラインを集める ---
   let allTweets = [];
-  const nowMs = Date.now();
-  const WEEK_MS = 7 * 86400000;
-  for (let w = 0; w < WEEKS_BACK; w++) {
-    // until は当日も含むよう +1日。since は1日重ねる。
-    const untilMs = nowMs - w * WEEK_MS + 86400000;
-    const sinceMs = nowMs - (w + 1) * WEEK_MS - 86400000;
-    const untilEpoch = Math.floor(untilMs / 1000);
-    const sinceEpoch = Math.floor(sinceMs / 1000);
-    const label = `${ymd(new Date(sinceMs))}〜${ymd(new Date(untilMs))}`;
-    const chunk = await fetchChunk(sinceEpoch, untilEpoch, label);
-    allTweets = allTweets.concat(chunk);
+  let cursor = null;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let data;
+    try {
+      data = await fetchPage(cursor);
+    } catch (err) {
+      console.error("取得に失敗:", err.message);
+      break;
+    }
+    const pageTweets = Array.isArray(data?.tweets) ? data.tweets : [];
+    allTweets = allTweets.concat(pageTweets);
+    cursor = data?.next_cursor || null;
+    console.log(
+      `page ${page + 1}: ${pageTweets.length}件 (累計 ${allTweets.length}) next_cursor=${cursor ? "あり" : "なし"}`
+    );
+    if (!cursor) {
+      console.log("  完了: タイムライン終端に到達。");
+      break;
+    }
   }
 
-  // 重複除去(チャンク境界で重なることがある)
+  // 重複除去
   const seen = new Set();
   allTweets = allTweets.filter((t) => {
-    const id = t.id;
+    const id = t.id || t.id_str;
     if (!id || seen.has(id)) return false;
     seen.add(id);
     return true;
   });
-  console.log(`全チャンク統合: 重複除去後 合計 ${allTweets.length}件`);
+  console.log(`取得完了: 重複除去後 合計 ${allTweets.length}件`);
 
-  // --- フォロワー数などは author 情報から取る ---
-  const me = allTweets.find(
-    (t) => t.author?.userName?.toLowerCase() === USERNAME.toLowerCase()
-  );
-  const author = me?.author || allTweets[0]?.author || {};
+  // --- フォロワー数などは author/user 情報から取る ---
+  // (Sorsaは author を埋め込むが、簡略形だと文字列のことがある。両対応で探す)
+  let author = {};
+  for (const t of allTweets) {
+    const a = t.author && typeof t.author === "object" ? t.author : t.user;
+    if (a && typeof a === "object" && (a.followers ?? a.followers_count) != null) {
+      author = a;
+      break;
+    }
+  }
   fs.appendFileSync(
     ACCOUNT_CSV,
     csvRow([
       fetchedAt,
-      author.followers ?? "",
-      author.following ?? "",
-      author.statusesCount ?? "",
+      num(author, "followers", "followers_count"),
+      num(author, "following", "following_count"),
+      num(author, "statusesCount", "statuses_count", "tweet_count"),
     ])
   );
-  console.log(`account: followers=${author.followers ?? "?"}`);
+  console.log(
+    `account: followers=${num(author, "followers", "followers_count") || "?"}`
+  );
 
   // --- 本文マスターと数値を振り分け ---
   const known = loadExistingTweetIds();
@@ -197,15 +180,16 @@ async function main() {
       skippedRT++;
       continue;
     }
-    const id = t.id;
+    const id = t.id || t.id_str;
     if (!id) continue;
     kept++;
 
+    const text = str(t, "content", "full_text", "text");
+    const createdAt = str(t, "created_at", "date", "createdAt");
+    const url = str(t, "link", "url");
+
     if (!known.has(String(id))) {
-      fs.appendFileSync(
-        TWEETS_CSV,
-        csvRow([id, t.text || "", t.createdAt || "", t.url || ""])
-      );
+      fs.appendFileSync(TWEETS_CSV, csvRow([id, text, createdAt, url]));
       known.add(String(id));
       newMaster++;
     }
@@ -213,12 +197,12 @@ async function main() {
     metricRows += csvRow([
       fetchedAt,
       id,
-      t.likeCount ?? 0,
-      t.retweetCount ?? 0,
-      t.replyCount ?? 0,
-      t.quoteCount ?? 0,
-      t.viewCount ?? 0,
-      t.bookmarkCount ?? 0,
+      num(t, "likes", "likes_count", "likeCount", "favorite_count"),
+      num(t, "retweets", "retweet_count", "retweetCount"),
+      num(t, "replies", "reply_count", "replyCount"),
+      num(t, "quotes", "quote_count", "quoteCount"),
+      num(t, "views", "view_count", "viewCount"),
+      num(t, "bookmarks", "bookmark_count", "bookmarkCount"),
     ]);
   }
 

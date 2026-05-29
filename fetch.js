@@ -18,7 +18,7 @@ const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
 const BASE = "https://api.twitterapi.io";
 
 // ページングの最大ページ数(1ページ約20件。100件強なら6ページで十分)
-const MAX_PAGES = 6;
+const MAX_PAGES = 20;
 
 const DATA_DIR = path.join(__dirname, "data");
 const TWEETS_CSV = path.join(DATA_DIR, "tweets.csv");

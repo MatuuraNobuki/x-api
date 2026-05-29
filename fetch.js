@@ -1,10 +1,14 @@
 // fetch.js
-// TwitterAPI.io から自分のツイートとアカウント情報を取得し、
+// TwitterAPI.io から @suiryuuuuu のツイートを取得し、
 // 3つのCSV(tweets / metrics / account)に追記・更新する。
+//
+//  - リツイート(retweeted_tweet が null でないもの)は除外する
+//  - has_next_page / next_cursor を使ってページングし、上限まで集める
+//  - フォロワー数はツイート内の author 情報から取る(別API呼び出し不要)
 //
 // 必要な環境変数:
 //   TWITTERAPI_KEY ... TwitterAPI.io のAPIキー (GitHub Secrets から渡す)
-//   X_USERNAME     ... 対象のハンドル (@抜き)。未設定なら下のDEFAULTを使う。
+//   X_USERNAME     ... 対象のハンドル(@抜き)。未設定なら下のDEFAULT。
 
 const fs = require("fs");
 const path = require("path");
@@ -13,7 +17,9 @@ const API_KEY = process.env.TWITTERAPI_KEY;
 const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
 const BASE = "https://api.twitterapi.io";
 
-// 出力先(リポジトリ直下の data/ フォルダ)
+// ページングの最大ページ数(1ページ約20件。100件強なら6ページで十分)
+const MAX_PAGES = 6;
+
 const DATA_DIR = path.join(__dirname, "data");
 const TWEETS_CSV = path.join(DATA_DIR, "tweets.csv");
 const METRICS_CSV = path.join(DATA_DIR, "metrics.csv");
@@ -24,28 +30,20 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-// --- CSVの値を安全に囲むためのヘルパー ---
-// カンマ・改行・ダブルクォートを含む値をRFC4180準拠でエスケープする。
+// --- CSVエスケープ(カンマ・改行・引用符をRFC4180準拠で処理) ---
 function csvCell(value) {
   const s = value === null || value === undefined ? "" : String(value);
-  if (/[",\n\r]/.test(s)) {
-    return '"' + s.replace(/"/g, '""') + '"';
-  }
+  if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
   return s;
 }
-
 function csvRow(cells) {
   return cells.map(csvCell).join(",") + "\n";
 }
-
-// ファイルが無ければヘッダー付きで作る
 function ensureFile(file, header) {
-  if (!fs.existsSync(file)) {
-    fs.writeFileSync(file, header);
-  }
+  if (!fs.existsSync(file)) fs.writeFileSync(file, header);
 }
 
-// 既存tweets.csvから、登録済みのツイートIDの集合を読む(重複追記を防ぐ)
+// 既存tweets.csvから登録済みツイートIDを読む(本文の重複追記を防ぐ)
 function loadExistingTweetIds() {
   const ids = new Set();
   if (!fs.existsSync(TWEETS_CSV)) return ids;
@@ -53,7 +51,6 @@ function loadExistingTweetIds() {
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
     if (!line) continue;
-    // 先頭セル(tweet_id)だけ取り出す。idは数値文字列なので単純splitで十分。
     const firstComma = line.indexOf(",");
     const id = firstComma === -1 ? line : line.slice(0, firstComma);
     if (id) ids.add(id.replace(/^"|"$/g, ""));
@@ -64,15 +61,15 @@ function loadExistingTweetIds() {
 // fetch のラッパー(リトライ付き)
 async function apiGet(endpoint, params) {
   const url = new URL(BASE + endpoint);
-  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
+  });
 
   const maxRetry = 3;
   for (let attempt = 1; attempt <= maxRetry; attempt++) {
     try {
       const res = await fetch(url, { headers: { "X-API-Key": API_KEY } });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       return await res.json();
     } catch (err) {
       console.error(`リクエスト失敗 (${attempt}/${maxRetry}): ${err.message}`);
@@ -82,33 +79,19 @@ async function apiGet(endpoint, params) {
   }
 }
 
-// ツイート配列・ユーザー情報は、エンドポイントによって入れ子の形が違うことがある。
-// よくある形を順に探して取り出す。
+// 1ページ分のツイート配列を取り出す(実レスポンスは data.tweets)
 function extractTweets(json) {
-  if (Array.isArray(json?.tweets)) return json.tweets;
   if (Array.isArray(json?.data?.tweets)) return json.data.tweets;
+  if (Array.isArray(json?.tweets)) return json.tweets;
   if (Array.isArray(json?.data)) return json.data;
   return [];
 }
 
-function extractUser(json) {
-  return json?.data || json?.user || json || {};
-}
-
-// 1ツイートから数値を取り出す。フィールド名の揺れに両対応。
-function pickTweetMetrics(t) {
-  return {
-    id: t.id || t.id_str || t.tweet_id,
-    text: t.text || t.full_text || "",
-    createdAt: t.createdAt || t.created_at || "",
-    url: t.url || (t.id ? `https://x.com/${USERNAME}/status/${t.id}` : ""),
-    likes: t.likeCount ?? t.favorite_count ?? t.favoriteCount ?? 0,
-    retweets: t.retweetCount ?? t.retweet_count ?? 0,
-    replies: t.replyCount ?? t.reply_count ?? 0,
-    quotes: t.quoteCount ?? t.quote_count ?? 0,
-    views: t.viewCount ?? t.view_count ?? t.views ?? 0,
-    bookmarks: t.bookmarkCount ?? t.bookmark_count ?? 0,
-  };
+// リツイート判定: retweeted_tweet が存在すればRT。保険で本文の "RT @" も見る。
+function isRetweet(t) {
+  if (t.retweeted_tweet) return true;
+  if (typeof t.text === "string" && t.text.startsWith("RT @")) return true;
+  return false;
 }
 
 async function main() {
@@ -118,74 +101,87 @@ async function main() {
     METRICS_CSV,
     "fetched_at,tweet_id,likes,retweets,replies,quotes,views,bookmarks\n"
   );
-  ensureFile(
-    ACCOUNT_CSV,
-    "fetched_at,followers,following,tweet_count\n"
-  );
+  ensureFile(ACCOUNT_CSV, "fetched_at,followers,following,tweet_count\n");
 
-  // 取得時刻(UTC, ISO8601)。全行で共通のタイムスタンプを使う。
   const fetchedAt = new Date().toISOString();
 
-  // --- 1) アカウント情報(フォロワー数など) ---
-  let user = {};
-  try {
-    const userJson = await apiGet("/twitter/user/info", { userName: USERNAME });
-    user = extractUser(userJson);
-  } catch (err) {
-    console.error("ユーザー情報の取得に失敗:", err.message);
+  // --- ページングしながら全ツイートを集める ---
+  let allTweets = [];
+  let cursor = "";
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let json;
+    try {
+      json = await apiGet("/twitter/user/last_tweets", {
+        userName: USERNAME,
+        cursor,
+      });
+    } catch (err) {
+      console.error("ツイート取得に失敗:", err.message);
+      break;
+    }
+    const pageTweets = extractTweets(json);
+    allTweets = allTweets.concat(pageTweets);
+    console.log(`page ${page + 1}: ${pageTweets.length}件 (累計 ${allTweets.length})`);
+
+    if (!json?.has_next_page || !json?.next_cursor) break;
+    cursor = json.next_cursor;
   }
 
-  const followers = user.followers ?? user.followersCount ?? "";
-  const following = user.following ?? user.followingCount ?? "";
-  const tweetCount = user.statusesCount ?? user.tweetCount ?? "";
+  // --- フォロワー数などは author 情報から取る(自分のツイートのauthorを使う) ---
+  const me = allTweets.find((t) => t.author?.userName?.toLowerCase() === USERNAME.toLowerCase());
+  const author = me?.author || allTweets[0]?.author || {};
   fs.appendFileSync(
     ACCOUNT_CSV,
-    csvRow([fetchedAt, followers, following, tweetCount])
+    csvRow([
+      fetchedAt,
+      author.followers ?? "",
+      author.following ?? "",
+      author.statusesCount ?? "",
+    ])
   );
-  console.log(`account: followers=${followers}`);
+  console.log(`account: followers=${author.followers ?? "?"}`);
 
-  // --- 2) 最新ツイート ---
-  let tweets = [];
-  try {
-    const tweetsJson = await apiGet("/twitter/user/last_tweets", {
-      userName: USERNAME,
-    });
-    tweets = extractTweets(tweetsJson);
-  } catch (err) {
-    console.error("ツイート取得に失敗:", err.message);
-  }
-  console.log(`tweets fetched: ${tweets.length}`);
-
+  // --- RTを除外して、本文マスターと数値を振り分け ---
   const known = loadExistingTweetIds();
   let newMaster = 0;
+  let kept = 0;
+  let skippedRT = 0;
   let metricRows = "";
 
-  for (const raw of tweets) {
-    const t = pickTweetMetrics(raw);
-    if (!t.id) continue;
+  for (const t of allTweets) {
+    if (isRetweet(t)) {
+      skippedRT++;
+      continue;
+    }
+    const id = t.id;
+    if (!id) continue;
+    kept++;
 
-    // 本文等は初回だけマスターに追加
-    if (!known.has(String(t.id))) {
-      fs.appendFileSync(TWEETS_CSV, csvRow([t.id, t.text, t.createdAt, t.url]));
-      known.add(String(t.id));
+    if (!known.has(String(id))) {
+      fs.appendFileSync(
+        TWEETS_CSV,
+        csvRow([id, t.text || "", t.createdAt || "", t.url || ""])
+      );
+      known.add(String(id));
       newMaster++;
     }
 
-    // 数値は毎回 metrics に追記
     metricRows += csvRow([
       fetchedAt,
-      t.id,
-      t.likes,
-      t.retweets,
-      t.replies,
-      t.quotes,
-      t.views,
-      t.bookmarks,
+      id,
+      t.likeCount ?? 0,
+      t.retweetCount ?? 0,
+      t.replyCount ?? 0,
+      t.quoteCount ?? 0,
+      t.viewCount ?? 0,
+      t.bookmarkCount ?? 0,
     ]);
   }
 
   if (metricRows) fs.appendFileSync(METRICS_CSV, metricRows);
-  console.log(`new master rows: ${newMaster}, metric rows added: ${tweets.length}`);
+  console.log(
+    `集計: 対象ツイート ${kept}件 / RT除外 ${skippedRT}件 / 新規マスター ${newMaster}件`
+  );
 }
 
 main().catch((err) => {

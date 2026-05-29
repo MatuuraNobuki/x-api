@@ -17,7 +17,7 @@ const path = require("path");
 
 const API_KEY = process.env.SORSA_API_KEY;
 const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
-const MAX_PAGES = parseInt(process.env.MAX_PAGES || "20", 10);
+const MAX_PAGES = parseInt(process.env.MAX_PAGES || "5", 10);
 const BASE_URL = "https://api.sorsa.io/v3";
 
 const DATA_DIR = path.join(__dirname, "data");
@@ -94,9 +94,11 @@ function str(t, ...keys) {
 }
 
 function isRetweet(t) {
+  // Sorsa: RTは retweeted_status に元ツイートが入る(nullでなければRT)
+  if (t.retweeted_status) return true;
   if (t.isRetweet === true || t.is_retweet === true) return true;
-  if (t.retweeted_tweet) return true;
-  const text = str(t, "content", "full_text", "text");
+  if (t.retweeted_tweet) return true; // 他形式の保険
+  const text = str(t, "full_text", "content", "text");
   if (typeof text === "string" && text.startsWith("RT @")) return true;
   return false;
 }

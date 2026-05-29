@@ -101,6 +101,24 @@ function isRetweet(t) {
   return false;
 }
 
+// このツイートの著者ハンドル(@抜き)を取り出す。
+// 本番Sorsa: user.username。Playground簡略形: トップレベル handle。両対応。
+function authorHandle(t) {
+  const a = (t.user && typeof t.user === "object") ? t.user
+          : (t.author && typeof t.author === "object") ? t.author
+          : null;
+  let h = "";
+  if (a) h = str(a, "username", "userName", "screen_name", "handle");
+  if (!h) h = str(t, "handle"); // Playground簡略形のフォールバック
+  return String(h).replace(/^@/, "").toLowerCase();
+}
+
+// 本人の投稿か(他人のいいね・引用元などを除外するため)。
+// 著者が判定できない場合は安全側に倒して除外する(混入を確実に防ぐ)。
+function isOwnTweet(t) {
+  return authorHandle(t) === USERNAME.toLowerCase();
+}
+
 async function main() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   ensureFile(TWEETS_CSV, "tweet_id,text,created_at,url\n");
@@ -149,8 +167,10 @@ async function main() {
   // (Sorsaは author を埋め込むが、簡略形だと文字列のことがある。両対応で探す)
   let author = {};
   for (const t of allTweets) {
-    const a = t.author && typeof t.author === "object" ? t.author : t.user;
-    if (a && typeof a === "object" && (a.followers ?? a.followers_count) != null) {
+    if (!isOwnTweet(t)) continue; // 本人のツイートのauthorだけ使う
+    const a = (t.user && typeof t.user === "object") ? t.user
+            : (t.author && typeof t.author === "object") ? t.author : null;
+    if (a && (a.followers ?? a.followers_count) != null) {
       author = a;
       break;
     }
@@ -159,13 +179,13 @@ async function main() {
     ACCOUNT_CSV,
     csvRow([
       fetchedAt,
-      num(author, "followers", "followers_count"),
-      num(author, "following", "following_count"),
-      num(author, "statusesCount", "statuses_count", "tweet_count"),
+      num(author, "followers_count", "followers"),
+      num(author, "following_count", "following"),
+      num(author, "tweets_count", "statuses_count", "statusesCount", "tweet_count"),
     ])
   );
   console.log(
-    `account: followers=${num(author, "followers", "followers_count") || "?"}`
+    `account: followers=${num(author, "followers_count", "followers") || "?"}`
   );
 
   // --- 本文マスターと数値を振り分け ---
@@ -173,11 +193,19 @@ async function main() {
   let newMaster = 0;
   let kept = 0;
   let skippedRT = 0;
+  let skippedOther = 0;
+  const otherAuthors = new Set();
   let metricRows = "";
 
   for (const t of allTweets) {
     if (isRetweet(t)) {
       skippedRT++;
+      continue;
+    }
+    // 他人の投稿(いいね・引用元など)を除外
+    if (!isOwnTweet(t)) {
+      skippedOther++;
+      otherAuthors.add(authorHandle(t));
       continue;
     }
     const id = t.id || t.id_str;
@@ -208,8 +236,11 @@ async function main() {
 
   if (metricRows) fs.appendFileSync(METRICS_CSV, metricRows);
   console.log(
-    `集計: 対象ツイート ${kept}件 / RT除外 ${skippedRT}件 / 新規マスター ${newMaster}件`
+    `集計: 対象 ${kept}件 / RT除外 ${skippedRT}件 / 他人の投稿除外 ${skippedOther}件 / 新規マスター ${newMaster}件`
   );
+  if (otherAuthors.size > 0) {
+    console.log(`  除外した他人の著者: ${[...otherAuthors].join(", ")}`);
+  }
 }
 
 main().catch((err) => {

@@ -1,10 +1,12 @@
 // fetch.js
-// TwitterAPI.io から @suiryuuuuu のツイートを取得し、
+// TwitterAPI.io の Advanced Search で @suiryuuuuu のツイートを取得し、
 // 3つのCSV(tweets / metrics / account)に追記・更新する。
 //
-//  - リツイート(retweeted_tweet が null でないもの)は除外する
-//  - has_next_page / next_cursor を使ってページングし、上限まで集める
-//  - フォロワー数はツイート内の author 情報から取る(別API呼び出し不要)
+// なぜ Advanced Search を使うか:
+//   /twitter/user/last_tweets はページングが不安定で、続きがあるのに
+//   途中で0件や has_next_page=false を返し、取りこぼしが起きた。
+//   /twitter/tweet/advanced_search は query="from:ユーザー名" で検索する方式で、
+//   cursor ベースのページングが安定している。RTもクエリ側で除外できる。
 //
 // 必要な環境変数:
 //   TWITTERAPI_KEY ... TwitterAPI.io のAPIキー (GitHub Secrets から渡す)
@@ -17,9 +19,8 @@ const API_KEY = process.env.TWITTERAPI_KEY;
 const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
 const BASE = "https://api.twitterapi.io";
 
-// ページングの最大ページ数。空ページを挟むことがあるので余裕をもたせる。
-// (直近の投稿を取り切るのが目的。多すぎ＝古い投稿まで毎時取得＝割高 なので程々に)
-const MAX_PAGES = 12;
+// ページングの最大ページ数(安全弁)。1ページ約20件返るので、直近を網羅するなら十分。
+const MAX_PAGES = 15;
 
 const DATA_DIR = path.join(__dirname, "data");
 const TWEETS_CSV = path.join(DATA_DIR, "tweets.csv");
@@ -80,15 +81,15 @@ async function apiGet(endpoint, params) {
   }
 }
 
-// 1ページ分のツイート配列を取り出す(実レスポンスは data.tweets)
+// 1ページ分のツイート配列を取り出す
 function extractTweets(json) {
-  if (Array.isArray(json?.data?.tweets)) return json.data.tweets;
   if (Array.isArray(json?.tweets)) return json.tweets;
+  if (Array.isArray(json?.data?.tweets)) return json.data.tweets;
   if (Array.isArray(json?.data)) return json.data;
   return [];
 }
 
-// リツイート判定: retweeted_tweet が存在すればRT。保険で本文の "RT @" も見る。
+// 保険のRT判定(クエリ側で除外済みだが、念のため)
 function isRetweet(t) {
   if (t.retweeted_tweet) return true;
   if (typeof t.text === "string" && t.text.startsWith("RT @")) return true;
@@ -106,24 +107,24 @@ async function main() {
 
   const fetchedAt = new Date().toISOString();
 
-  // --- ページングしながら全ツイートを集める ---
-  // このAPIはページごとの件数が不安定で、途中で0件ページを返すことがある。
-  // has_next_page と next_cursor がある限り、空ページが来ても数回は粘って先を試す。
+  // --- Advanced Search でページングしながら集める ---
+  // query: from:ユーザー名 でそのユーザーの投稿。-filter:retweets でRTを除外。
+  // queryType: "Latest" で新しい順。
+  const query = `from:${USERNAME} -filter:retweets`;
   let allTweets = [];
   let cursor = "";
-  let prevCursor = null;
-  let emptyStreak = 0;
-  const MAX_EMPTY_STREAK = 3; // 連続で空ページがこの回数続いたら本当に終わりと判断
+  const usedCursors = new Set();
 
   for (let page = 0; page < MAX_PAGES; page++) {
     let json;
     try {
-      json = await apiGet("/twitter/user/last_tweets", {
-        userName: USERNAME,
+      json = await apiGet("/twitter/tweet/advanced_search", {
+        query,
+        queryType: "Latest",
         cursor,
       });
     } catch (err) {
-      console.error("ツイート取得に失敗:", err.message);
+      console.error("検索取得に失敗:", err.message);
       break;
     }
     const pageTweets = extractTweets(json);
@@ -136,38 +137,24 @@ async function main() {
         `has_next_page=${hasNext} next_cursor="${nextCursor.slice(0, 8)}..."`
     );
 
-    // 空ページの連続をカウント(一時的な空きと本当の終端を区別する)
-    if (pageTweets.length === 0) {
-      emptyStreak++;
-      if (emptyStreak >= MAX_EMPTY_STREAK) {
-        console.log(`  停止: 空ページが${MAX_EMPTY_STREAK}回連続。終端と判断。`);
-        break;
-      }
-    } else {
-      emptyStreak = 0;
+    // 検索エンドポイントは has_next_page が信頼できる。false なら終了。
+    if (!hasNext) {
+      console.log("  完了: has_next_page=false。全ページ取得済み。");
+      break;
     }
-
-    // 次に進むカーソルが無ければ終わり
     if (!nextCursor) {
-      console.log("  停止: next_cursor が空。これ以上辿れない。");
+      console.log("  停止: next_cursor が空。");
       break;
     }
-    // カーソルが前回と同じ = 同じページをループする異常。打ち切る。
-    if (nextCursor === prevCursor) {
-      console.log("  停止: next_cursor が前回と同じ。無限ループ回避のため打ち切り。");
+    if (usedCursors.has(nextCursor)) {
+      console.log("  停止: 既出カーソル。ループ回避。");
       break;
     }
-    // has_next_page が false でも、cursor があり中身が取れている間は念のため進む。
-    // (このAPIは has_next_page を早めに false にすることがあるため)
-    if (!hasNext && pageTweets.length === 0) {
-      console.log("  停止: has_next_page=false かつ空ページ。終端と判断。");
-      break;
-    }
-
-    prevCursor = nextCursor;
+    usedCursors.add(nextCursor);
     cursor = nextCursor;
   }
-  // 重複ツイート(ページ境界で混じることがある)をID基準で除去
+
+  // 重複除去(念のため)
   const seen = new Set();
   allTweets = allTweets.filter((t) => {
     const id = t.id;
@@ -177,8 +164,10 @@ async function main() {
   });
   console.log(`ページング終了: 重複除去後 合計 ${allTweets.length}件`);
 
-  // --- フォロワー数などは author 情報から取る(自分のツイートのauthorを使う) ---
-  const me = allTweets.find((t) => t.author?.userName?.toLowerCase() === USERNAME.toLowerCase());
+  // --- フォロワー数などは author 情報から取る ---
+  const me = allTweets.find(
+    (t) => t.author?.userName?.toLowerCase() === USERNAME.toLowerCase()
+  );
   const author = me?.author || allTweets[0]?.author || {};
   fs.appendFileSync(
     ACCOUNT_CSV,
@@ -191,7 +180,7 @@ async function main() {
   );
   console.log(`account: followers=${author.followers ?? "?"}`);
 
-  // --- RTを除外して、本文マスターと数値を振り分け ---
+  // --- 本文マスターと数値を振り分け(保険でRTも弾く) ---
   const known = loadExistingTweetIds();
   let newMaster = 0;
   let kept = 0;

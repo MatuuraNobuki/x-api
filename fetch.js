@@ -18,7 +18,7 @@ const path = require("path");
 
 const API_KEY = process.env.TWITTERAPI_KEY;
 const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
-const WEEKS_BACK = parseInt(process.env.WEEKS_BACK || "10", 10);
+const WEEKS_BACK = parseInt(process.env.WEEKS_BACK || "6", 10);
 const BASE = "https://api.twitterapi.io";
 
 // 1チャンク内のページング安全弁
@@ -97,10 +97,12 @@ function ymd(date) {
   return date.toISOString().slice(0, 10);
 }
 
-// 1つの日付チャンクをページングして全ツイートを返す
-async function fetchChunk(sinceStr, untilStr) {
+// 1つの日付チャンクをページングして全ツイートを返す。
+// 重要: このAPIは since:/until:(YYYY-MM-DD) を無視する。
+//       Unix秒の since_time:/until_time: を使わないと日付で絞れない。
+async function fetchChunk(sinceEpoch, untilEpoch, label) {
   // -filter:retweets でRT除外。返信や雑談はそのまま含まれる。
-  const query = `from:${USERNAME} since:${sinceStr} until:${untilStr} -filter:retweets`;
+  const query = `from:${USERNAME} since_time:${sinceEpoch} until_time:${untilEpoch} -filter:retweets`;
   let tweets = [];
   let cursor = "";
   const usedCursors = new Set();
@@ -114,7 +116,7 @@ async function fetchChunk(sinceStr, untilStr) {
         cursor,
       });
     } catch (err) {
-      console.error(`  [${sinceStr}〜${untilStr}] 取得失敗:`, err.message);
+      console.error(`  [${label}] 取得失敗:`, err.message);
       break;
     }
     const pageTweets = extractTweets(json);
@@ -126,7 +128,7 @@ async function fetchChunk(sinceStr, untilStr) {
     usedCursors.add(nextCursor);
     cursor = nextCursor;
   }
-  console.log(`  チャンク ${sinceStr}〜${untilStr}: ${tweets.length}件`);
+  console.log(`  チャンク ${label}: ${tweets.length}件`);
   return tweets;
 }
 
@@ -142,15 +144,18 @@ async function main() {
   const fetchedAt = new Date().toISOString();
 
   // --- 今日から WEEKS_BACK 週ぶん、1週間ごとの窓で検索する ---
+  // since_time/until_time は Unix秒。窓を1日重ねて境界の取りこぼしを防ぐ。
   let allTweets = [];
-  const now = new Date();
+  const nowMs = Date.now();
+  const WEEK_MS = 7 * 86400000;
   for (let w = 0; w < WEEKS_BACK; w++) {
-    const until = new Date(now.getTime() - w * 7 * 86400000);
-    const since = new Date(now.getTime() - (w + 1) * 7 * 86400000);
-    // until は排他的なので、当日分も拾えるよう最新チャンクは +1日 する
-    const untilStr = ymd(new Date(until.getTime() + 86400000));
-    const sinceStr = ymd(since);
-    const chunk = await fetchChunk(sinceStr, untilStr);
+    // until は当日も含むよう +1日。since は1日重ねる。
+    const untilMs = nowMs - w * WEEK_MS + 86400000;
+    const sinceMs = nowMs - (w + 1) * WEEK_MS - 86400000;
+    const untilEpoch = Math.floor(untilMs / 1000);
+    const sinceEpoch = Math.floor(sinceMs / 1000);
+    const label = `${ymd(new Date(sinceMs))}〜${ymd(new Date(untilMs))}`;
+    const chunk = await fetchChunk(sinceEpoch, untilEpoch, label);
     allTweets = allTweets.concat(chunk);
   }
 

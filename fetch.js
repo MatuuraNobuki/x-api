@@ -17,8 +17,9 @@ const API_KEY = process.env.TWITTERAPI_KEY;
 const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
 const BASE = "https://api.twitterapi.io";
 
-// ページングの最大ページ数(1ページ約20件。100件強なら6ページで十分)
-const MAX_PAGES = 20;
+// ページングの最大ページ数。空ページを挟むことがあるので余裕をもたせる。
+// (直近の投稿を取り切るのが目的。多すぎ＝古い投稿まで毎時取得＝割高 なので程々に)
+const MAX_PAGES = 12;
 
 const DATA_DIR = path.join(__dirname, "data");
 const TWEETS_CSV = path.join(DATA_DIR, "tweets.csv");
@@ -106,8 +107,14 @@ async function main() {
   const fetchedAt = new Date().toISOString();
 
   // --- ページングしながら全ツイートを集める ---
+  // このAPIはページごとの件数が不安定で、途中で0件ページを返すことがある。
+  // has_next_page と next_cursor がある限り、空ページが来ても数回は粘って先を試す。
   let allTweets = [];
   let cursor = "";
+  let prevCursor = null;
+  let emptyStreak = 0;
+  const MAX_EMPTY_STREAK = 3; // 連続で空ページがこの回数続いたら本当に終わりと判断
+
   for (let page = 0; page < MAX_PAGES; page++) {
     let json;
     try {
@@ -121,11 +128,54 @@ async function main() {
     }
     const pageTweets = extractTweets(json);
     allTweets = allTweets.concat(pageTweets);
-    console.log(`page ${page + 1}: ${pageTweets.length}件 (累計 ${allTweets.length})`);
 
-    if (!json?.has_next_page || !json?.next_cursor) break;
-    cursor = json.next_cursor;
+    const hasNext = json?.has_next_page;
+    const nextCursor = json?.next_cursor || "";
+    console.log(
+      `page ${page + 1}: ${pageTweets.length}件 (累計 ${allTweets.length}) ` +
+        `has_next_page=${hasNext} next_cursor="${nextCursor.slice(0, 8)}..."`
+    );
+
+    // 空ページの連続をカウント(一時的な空きと本当の終端を区別する)
+    if (pageTweets.length === 0) {
+      emptyStreak++;
+      if (emptyStreak >= MAX_EMPTY_STREAK) {
+        console.log(`  停止: 空ページが${MAX_EMPTY_STREAK}回連続。終端と判断。`);
+        break;
+      }
+    } else {
+      emptyStreak = 0;
+    }
+
+    // 次に進むカーソルが無ければ終わり
+    if (!nextCursor) {
+      console.log("  停止: next_cursor が空。これ以上辿れない。");
+      break;
+    }
+    // カーソルが前回と同じ = 同じページをループする異常。打ち切る。
+    if (nextCursor === prevCursor) {
+      console.log("  停止: next_cursor が前回と同じ。無限ループ回避のため打ち切り。");
+      break;
+    }
+    // has_next_page が false でも、cursor があり中身が取れている間は念のため進む。
+    // (このAPIは has_next_page を早めに false にすることがあるため)
+    if (!hasNext && pageTweets.length === 0) {
+      console.log("  停止: has_next_page=false かつ空ページ。終端と判断。");
+      break;
+    }
+
+    prevCursor = nextCursor;
+    cursor = nextCursor;
   }
+  // 重複ツイート(ページ境界で混じることがある)をID基準で除去
+  const seen = new Set();
+  allTweets = allTweets.filter((t) => {
+    const id = t.id;
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  console.log(`ページング終了: 重複除去後 合計 ${allTweets.length}件`);
 
   // --- フォロワー数などは author 情報から取る(自分のツイートのauthorを使う) ---
   const me = allTweets.find((t) => t.author?.userName?.toLowerCase() === USERNAME.toLowerCase());

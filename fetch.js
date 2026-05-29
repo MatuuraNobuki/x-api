@@ -182,7 +182,7 @@ async function main() {
     csvRow([
       fetchedAt,
       num(author, "followers_count", "followers"),
-      num(author, "following_count", "following"),
+      num(author, "followings_count", "following"),
       num(author, "tweets_count", "statuses_count", "statusesCount", "tweet_count"),
     ])
   );

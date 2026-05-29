@@ -1,26 +1,28 @@
 // fetch.js
-// TwitterAPI.io の Advanced Search で @suiryuuuuu のツイートを取得し、
-// 3つのCSV(tweets / metrics / account)に追記・更新する。
+// TwitterAPI.io の Advanced Search を「日付チャンク分割」で叩き、
+// @suiryuuuuu のツイートを取りこぼしなく取得して3つのCSVに記録する。
 //
-// なぜ Advanced Search を使うか:
-//   /twitter/user/last_tweets はページングが不安定で、続きがあるのに
-//   途中で0件や has_next_page=false を返し、取りこぼしが起きた。
-//   /twitter/tweet/advanced_search は query="from:ユーザー名" で検索する方式で、
-//   cursor ベースのページングが安定している。RTもクエリ側で除外できる。
+// なぜ日付チャンクか:
+//   Advanced Search の Latest は、日付指定なしだと新しい方に偏り、
+//   古いツイートが has_next_page=false で静かに打ち切られる(検索の深さの壁)。
+//   since:/until: で1週間ごとの窓に区切ると、各窓は件数が少なく深さの壁に
+//   当たらないため、全期間を確実に辿れる。
 //
 // 必要な環境変数:
 //   TWITTERAPI_KEY ... TwitterAPI.io のAPIキー (GitHub Secrets から渡す)
 //   X_USERNAME     ... 対象のハンドル(@抜き)。未設定なら下のDEFAULT。
+//   WEEKS_BACK     ... 何週間さかのぼるか(未設定なら6週)。
 
 const fs = require("fs");
 const path = require("path");
 
 const API_KEY = process.env.TWITTERAPI_KEY;
 const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
+const WEEKS_BACK = parseInt(process.env.WEEKS_BACK || "100", 10);
 const BASE = "https://api.twitterapi.io";
 
-// ページングの最大ページ数(安全弁)。1ページ約20件返るので、直近を網羅するなら十分。
-const MAX_PAGES = 15;
+// 1チャンク内のページング安全弁
+const MAX_PAGES_PER_CHUNK = 10;
 
 const DATA_DIR = path.join(__dirname, "data");
 const TWEETS_CSV = path.join(DATA_DIR, "tweets.csv");
@@ -32,7 +34,6 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-// --- CSVエスケープ(カンマ・改行・引用符をRFC4180準拠で処理) ---
 function csvCell(value) {
   const s = value === null || value === undefined ? "" : String(value);
   if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
@@ -45,7 +46,6 @@ function ensureFile(file, header) {
   if (!fs.existsSync(file)) fs.writeFileSync(file, header);
 }
 
-// 既存tweets.csvから登録済みツイートIDを読む(本文の重複追記を防ぐ)
 function loadExistingTweetIds() {
   const ids = new Set();
   if (!fs.existsSync(TWEETS_CSV)) return ids;
@@ -60,13 +60,11 @@ function loadExistingTweetIds() {
   return ids;
 }
 
-// fetch のラッパー(リトライ付き)
 async function apiGet(endpoint, params) {
   const url = new URL(BASE + endpoint);
   Object.entries(params).forEach(([k, v]) => {
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
   });
-
   const maxRetry = 3;
   for (let attempt = 1; attempt <= maxRetry; attempt++) {
     try {
@@ -81,7 +79,6 @@ async function apiGet(endpoint, params) {
   }
 }
 
-// 1ページ分のツイート配列を取り出す
 function extractTweets(json) {
   if (Array.isArray(json?.tweets)) return json.tweets;
   if (Array.isArray(json?.data?.tweets)) return json.data.tweets;
@@ -89,11 +86,48 @@ function extractTweets(json) {
   return [];
 }
 
-// 保険のRT判定(クエリ側で除外済みだが、念のため)
 function isRetweet(t) {
   if (t.retweeted_tweet) return true;
   if (typeof t.text === "string" && t.text.startsWith("RT @")) return true;
   return false;
+}
+
+// YYYY-MM-DD 形式(Advanced Search の since:/until: はこの形式のみ)
+function ymd(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+// 1つの日付チャンクをページングして全ツイートを返す
+async function fetchChunk(sinceStr, untilStr) {
+  // -filter:retweets でRT除外。返信や雑談はそのまま含まれる。
+  const query = `from:${USERNAME} since:${sinceStr} until:${untilStr} -filter:retweets`;
+  let tweets = [];
+  let cursor = "";
+  const usedCursors = new Set();
+
+  for (let page = 0; page < MAX_PAGES_PER_CHUNK; page++) {
+    let json;
+    try {
+      json = await apiGet("/twitter/tweet/advanced_search", {
+        query,
+        queryType: "Latest",
+        cursor,
+      });
+    } catch (err) {
+      console.error(`  [${sinceStr}〜${untilStr}] 取得失敗:`, err.message);
+      break;
+    }
+    const pageTweets = extractTweets(json);
+    tweets = tweets.concat(pageTweets);
+
+    const hasNext = json?.has_next_page;
+    const nextCursor = json?.next_cursor || "";
+    if (!hasNext || !nextCursor || usedCursors.has(nextCursor)) break;
+    usedCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  console.log(`  チャンク ${sinceStr}〜${untilStr}: ${tweets.length}件`);
+  return tweets;
 }
 
 async function main() {
@@ -107,54 +141,20 @@ async function main() {
 
   const fetchedAt = new Date().toISOString();
 
-  // --- Advanced Search でページングしながら集める ---
-  // query: from:ユーザー名 でそのユーザーの投稿。-filter:retweets でRTを除外。
-  // queryType: "Latest" で新しい順。
-  const query = `from:${USERNAME} -filter:retweets`;
+  // --- 今日から WEEKS_BACK 週ぶん、1週間ごとの窓で検索する ---
   let allTweets = [];
-  let cursor = "";
-  const usedCursors = new Set();
-
-  for (let page = 0; page < MAX_PAGES; page++) {
-    let json;
-    try {
-      json = await apiGet("/twitter/tweet/advanced_search", {
-        query,
-        queryType: "Latest",
-        cursor,
-      });
-    } catch (err) {
-      console.error("検索取得に失敗:", err.message);
-      break;
-    }
-    const pageTweets = extractTweets(json);
-    allTweets = allTweets.concat(pageTweets);
-
-    const hasNext = json?.has_next_page;
-    const nextCursor = json?.next_cursor || "";
-    console.log(
-      `page ${page + 1}: ${pageTweets.length}件 (累計 ${allTweets.length}) ` +
-        `has_next_page=${hasNext} next_cursor="${nextCursor.slice(0, 8)}..."`
-    );
-
-    // 検索エンドポイントは has_next_page が信頼できる。false なら終了。
-    if (!hasNext) {
-      console.log("  完了: has_next_page=false。全ページ取得済み。");
-      break;
-    }
-    if (!nextCursor) {
-      console.log("  停止: next_cursor が空。");
-      break;
-    }
-    if (usedCursors.has(nextCursor)) {
-      console.log("  停止: 既出カーソル。ループ回避。");
-      break;
-    }
-    usedCursors.add(nextCursor);
-    cursor = nextCursor;
+  const now = new Date();
+  for (let w = 0; w < WEEKS_BACK; w++) {
+    const until = new Date(now.getTime() - w * 7 * 86400000);
+    const since = new Date(now.getTime() - (w + 1) * 7 * 86400000);
+    // until は排他的なので、当日分も拾えるよう最新チャンクは +1日 する
+    const untilStr = ymd(new Date(until.getTime() + 86400000));
+    const sinceStr = ymd(since);
+    const chunk = await fetchChunk(sinceStr, untilStr);
+    allTweets = allTweets.concat(chunk);
   }
 
-  // 重複除去(念のため)
+  // 重複除去(チャンク境界で重なることがある)
   const seen = new Set();
   allTweets = allTweets.filter((t) => {
     const id = t.id;
@@ -162,7 +162,7 @@ async function main() {
     seen.add(id);
     return true;
   });
-  console.log(`ページング終了: 重複除去後 合計 ${allTweets.length}件`);
+  console.log(`全チャンク統合: 重複除去後 合計 ${allTweets.length}件`);
 
   // --- フォロワー数などは author 情報から取る ---
   const me = allTweets.find(
@@ -180,7 +180,7 @@ async function main() {
   );
   console.log(`account: followers=${author.followers ?? "?"}`);
 
-  // --- 本文マスターと数値を振り分け(保険でRTも弾く) ---
+  // --- 本文マスターと数値を振り分け ---
   const known = loadExistingTweetIds();
   let newMaster = 0;
   let kept = 0;

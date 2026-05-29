@@ -17,7 +17,7 @@ const path = require("path");
 
 const API_KEY = process.env.SORSA_API_KEY;
 const USERNAME = process.env.X_USERNAME || "suiryuuuuu";
-const MAX_PAGES = parseInt(process.env.MAX_PAGES || "5", 10);
+const MAX_PAGES = parseInt(process.env.MAX_PAGES || "50", 10);
 const BASE_URL = "https://api.sorsa.io/v3";
 
 const DATA_DIR = path.join(__dirname, "data");

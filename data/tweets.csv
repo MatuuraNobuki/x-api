@@ -37,3 +37,11 @@ tweet_id,text,created_at,url
 2055991467517317147,フレーム拘束 https://t.co/tWqV7MSLBa,Sun May 17 12:38:58 +0000 2026,https://x.com/suiryuuuuu/status/2055991467517317147
 2055910826717118743,水飲み場 https://t.co/3cvSTLlzxZ,Sun May 17 07:18:32 +0000 2026,https://x.com/suiryuuuuu/status/2055910826717118743
 2055517066090930208,ブランコ埋め https://t.co/stmor67FNJ,Sat May 16 05:13:52 +0000 2026,https://x.com/suiryuuuuu/status/2055517066090930208
+2057982139896062278,义肢拘束大チル | すいりゅ #pixiv https://t.co/CxvBemTYF7,Sat May 23 00:29:12 +0000 2026,https://x.com/suiryuuuuu/status/2057982139896062278
+2055919275865677882,@utftjh 『ジオメトリを変えずに画面空間で法線をぼかしてコーティングを擬似する』という独自部分だけを再現したい場合は、Normal AOVをCompositoのBlurノードでぼかしてOSL or Geometry Nodesで再シェーディング、または Shrinkwrap + Subdivision Surfaceで外殻メッシュを作る方が現実的かと,Sun May 17 07:52:07 +0000 2026,https://x.com/suiryuuuuu/status/2055919275865677882
+2055916676106076398,"@utftjh オフスクリーンRTに描画したスクリーンスペース法線とエッジマップをセパラブルガウシアンでぼかし、画面空間で Cook-Torrance BRDF (GGX法線分布 + Schlickフレネル近似) を再構築するものです。
+表面下散乱は簡易wrap diffuseで近似しています。PBRテクスチャはTri-planar投影で適用。",Sun May 17 07:41:47 +0000 2026,https://x.com/suiryuuuuu/status/2055916676106076398
+2053441768016978330,"@peperopepe4 ありがとうございます〜
+質感はエフェクト作ったりしてこだわっているのでそう言っていただけて嬉しいです！",Sun May 10 11:47:23 +0000 2026,https://x.com/suiryuuuuu/status/2053441768016978330
+2053298978796732827,https://t.co/MS1R19DGtP,Sun May 10 02:19:59 +0000 2026,https://x.com/suiryuuuuu/status/2053298978796732827
+2051800918220578893,金属拘束 https://t.co/ib2Rk6iTKL,Tue May 05 23:07:14 +0000 2026,https://x.com/suiryuuuuu/status/2051800918220578893
